@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Emergency Keyword Detection</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: sans-serif; text-align: center; padding: 20px; }
+    button { padding: 15px 25px; font-size: 18px; cursor: pointer; }
+    #status, #transcript, #result { margin-top: 20px; font-size: 16px; }
+    audio { margin-top: 20px; width: 90%; }
+  </style>
+</head>
+<body>
+  <h1>Audio Test</h1> 
+  <button id="startButton">Start 20s Recording</button>
+  <div id="status"></div>
+  <div id="transcript"></div>
+  <div id="result"></div>
+  <audio id="audioPlayer" controls></audio>
+  <script>
+const startButton = document.getElementById('startButton');
+const statusDiv = document.getElementById('status');
+const transcriptDiv = document.getElementById('transcript');
+const resultDiv = document.getElementById('result');
+const audioPlayer = document.getElementById('audioPlayer');
+
+const EMERGENCY_WORDS = [
+  "help", "fire", "emergency", "accident", "save me", "danger", "rape", "assault", "attack",
+  "police", "ambulance", "fall", "robbery", "kidnap", "sos", "alert", "trouble", "gun", "fight",
+  "bleeding", "injured", "dangerous", "hospital", "thief", "crash", "earthquake", "flood", "hurricane",
+  "bomb", "explosion", "panic", "shooting", "choking", "unconscious",
+  "firetruck", "firefighter", "rescue", "help me", "mayday", "distress", "hurt", "stuck",
+  "lost", "missing", "abduction", "burglary", "terrorist", "threat", "molestation",
+  "scream", "crying", "collapsed", "trapped", "disaster", "survivor", "tsunami", "landslide",
+  "cyclone", "tornado", "poison", "gas leak", "carbon monoxide", "electrocution", "heart attack",
+  "stroke", "seizure", "burn", "drowning", "fire alarm", "emergency exit", "evacuate", "run", "freeze"
+];
+
+const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+startButton.addEventListener('click', async () => {
+  startButton.disabled = true;
+  statusDiv.textContent = 'Waiting for microphone permission...';
+  transcriptDiv.textContent = '';
+  resultDiv.textContent = '';
+  audioPlayer.src = '';
+
+  let recognition;
+  let recognitionStoppedIntentionally = false;
+  // Use a Set to store all unique words found
+  const allFoundWords = new Set();
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    statusDiv.textContent = 'Recording and listening...';
+
+    // --- MediaRecorder Setup ---
+    const recorder = new MediaRecorder(stream);
+    const data = [];
+    recorder.ondataavailable = (e) => data.push(e.data);
+    recorder.onstop = () => {
+      stream.getTracks().forEach(t => t.stop());
+      const blob = new Blob(data, { type: 'audio/webm' });
+      audioPlayer.src = URL.createObjectURL(blob);
+      statusDiv.textContent = 'Recording finished. Playback available.';
+      startButton.disabled = false;
+    };
+
+    // --- Speech Recognition Setup ---
+    if (SpeechRecognition) {
+      recognition = new SpeechRecognition();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+
+      recognition.onresult = (event) => {
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+          const transcript = event.results[i][0].transcript.toLowerCase().trim();
+          transcriptDiv.textContent = `Heard: "${transcript}"`;
+
+          const foundWords = EMERGENCY_WORDS.filter(word => transcript.includes(word));
+          
+          if (foundWords.length > 0) {
+            // Add any newly found words to our Set
+            foundWords.forEach(word => allFoundWords.add(word));
+            
+            // Display all unique emergency words found so far
+            resultDiv.textContent = `EMERGENCY WORDS DETECTED: "${Array.from(allFoundWords).join(', ')}"`;
+            
+            // --- THE FIX ---
+            // The lines that stopped the recording and recognition have been removed from here.
+            // The process will now continue for the full 20 seconds.
+          }
+        }
+      };
+
+      recognition.onerror = (event) => {
+        statusDiv.textContent = `Speech recognition error: ${event.error}`;
+        console.error('Speech recognition error details:', event);
+      };
+      
+      // **THE FIX:** Automatically restart recognition if it stops
+      recognition.onend = () => {
+        if (!recognitionStoppedIntentionally) {
+          console.log('Speech recognition ended unexpectedly. Restarting...');
+          recognition.start(); // Restart it
+        } else {
+          console.log('Speech recognition stopped intentionally.');
+        }
+      };
+      
+      recognition.start();
+    }
+
+    // --- Start and Stop ---
+    recorder.start();
+    setTimeout(() => {
+      recognitionStoppedIntentionally = true; // Mark as intentional stop
+      if (recorder.state === 'recording') {
+        recorder.stop();
+      }
+      if (recognition) {
+        recognition.stop();
+      }
+    }, 20000);
+
+  } catch (error) {
+    statusDiv.textContent = `Error: ${error.message}`;
+    startButton.disabled = false;
+  }
+});
+  </script>
+</body>
+</html>
