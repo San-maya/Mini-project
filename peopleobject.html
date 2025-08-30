@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>people and Object Detection</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+  <!-- You can load YOLO models compiled for TF.js -->
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+  <style>
+    body { margin: 0; overflow: hidden; }
+    video, canvas { position: absolute; top: 0; left: 0; }
+    #info {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      color: white;
+      background: rgba(0,0,0,0.6);
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-size: 14px;
+      z-index: 10;
+    }
+  </style>
+</head>
+<body>
+  <div id="info">Loading YOLOv8 model...</div>
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="canvas"></canvas>
+
+  <script>
+    const video = document.getElementById("video");
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+    const info = document.getElementById("info");
+
+    let model;
+
+    async function setupCamera() {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "environment", width: 1280, height: 720 },
+        audio: false
+      });
+      video.srcObject = stream;
+      return new Promise(resolve => {
+        video.onloadedmetadata = () => resolve(video);
+      });
+    }
+
+    async function runYOLO() {
+      // ⚠ Placeholder: you’d need a YOLOv8 ONNX model converted for tfjs or ORT
+      // Example loads coco-ssd until YOLOv8.js weights are served
+      model = await cocoSsd.load();
+      info.innerText = "✅ Model loaded. Detecting...";
+
+      async function detectFrame() {
+        const predictions = await model.detect(video);
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+        predictions.forEach(pred => {
+  if (pred.score > 0.5) {
+    const [x, y, w, h] = pred.bbox;
+
+    ctx.strokeStyle = "#00FF00";
+    ctx.lineWidth = 3;
+    ctx.strokeRect(x, y, w, h);
+
+    ctx.fillStyle = "#00FF00";
+    ctx.font = "16px Arial";
+    ctx.fillText(
+      `${pred.class} ${(pred.score * 100).toFixed(1)}%`,
+      x,
+      y > 20 ? y - 5 : 20
+    );
+  }
+});
+
+
+        requestAnimationFrame(detectFrame);
+      }
+      detectFrame();
+    }
+
+    setupCamera().then(runYOLO);
+  </script>
+</body>
+</html>
