@@ -1,0 +1,416 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Offline Voice-Tone Detector — Happy/Sad/Tensed/Scared/Crying</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  body{font:15px/1.45 system-ui,Segoe UI,Roboto,Arial;margin:18px;}
+  h1{margin:0 0 8px;}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  button{padding:8px 12px;border-radius:10px;border:0;cursor:pointer}
+  .pill{padding:6px 10px;background:#eef3ff;border-radius:999px}
+  .card{border:1px solid #eee;border-radius:12px;padding:12px;margin-top:12px}
+  .bar{height:12px;background:#eceef3;border-radius:999px;overflow:hidden}
+  .bar > span{display:block;height:100%;background:#3b82f6}
+  table{width:100%;border-collapse:collapse}
+  td{padding:6px 8px;vertical-align:middle}
+  tr:nth-child(odd){background:#fafafa}
+  .muted{color:#666}
+  #log{font-family:monospace;background:#f7f7f7;padding:8px;border-radius:8px;max-height:160px;overflow:auto}
+</style>
+</head>
+<body>
+  <h1>Offline Voice-Tone Detector</h1>
+  <div class="muted">Detects (heuristics): <b>happy</b>, <b>sad</b>, <b>tensed</b>, <b>scared</b>, <b>crying</b>. No API required.</div>
+
+  <div class="row" style="margin-top:12px">
+    <button id="startBtn">Start</button>
+    <button id="stopBtn" disabled>Stop</button>
+    <span class="pill" id="status">idle</span>
+  </div>
+
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <div>
+        <div class="muted">Predicted tone</div>
+        <div id="winner" style="font-size:20px;margin-top:6px">—</div>
+      </div>
+      <div style="width:48%">
+        <div class="muted">Realtime scores (smoothed)</div>
+        <div id="scoreTable" style="margin-top:8px"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="muted">Raw features (for debugging)</div>
+    <div id="features" style="margin-top:8px;font-family:monospace"></div>
+  </div>
+
+  <div class="card">
+    <div class="muted">Log</div>
+    <div id="log"></div>
+  </div>
+
+<script>
+/* ----------------- Utilities ----------------- */
+const $ = s => document.querySelector(s);
+const log = (...a)=>{ const el = $('#log'); el.textContent += a.join(' ') + '\n'; el.scrollTop = el.scrollHeight; };
+const clamp = (v,min=0,max=1)=>Math.max(min,Math.min(max,v));
+
+/* ----------------- Audio + analysis setup ----------------- */
+let audioCtx, analyser, micStream, rafId;
+let bufferLen = 2048;
+let timeBuf = new Float32Array(bufferLen);
+let freqBuf, sampleRate = 44100;
+
+let running = false;
+
+/* Rolling history for normalization */
+const HISTORY = 40;
+const histPitch = [];
+const histRms = [];
+const histCentroid = [];
+const histEnvelope = []; // for crying detection (peaks)
+const histRolloff = [];
+const histEntropy = [];
+function pushHist(arr,val){ arr.push(val); if(arr.length>HISTORY) arr.shift(); }
+function mean(arr){ if(arr.length===0) return 0; return arr.reduce((a,b)=>a+b,0)/arr.length; }
+function std(arr){ const m=mean(arr); return Math.sqrt(mean(arr.map(x=> (x-m)*(x-m) ))); }
+function min(arr){ return arr.length? Math.min(...arr):0; }
+function max(arr){ return arr.length? Math.max(...arr):1; }
+
+/* EMA smoothing for final scores */
+const EMA_ALPHA = 0.35;
+const scoresEMA = { happy:0, sad:0, tensed:0, scared:0, crying:0 };
+function emaUpdate(k,v){ scoresEMA[k] = EMA_ALPHA * v + (1-EMA_ALPHA) * scoresEMA[k]; }
+
+/* ----------------- Feature extraction helpers ----------------- */
+/* RMS */
+function computeRMS(buf){
+  let sum = 0;
+  for(let i=0;i<buf.length;i++){ sum += buf[i]*buf[i]; }
+  return Math.sqrt(sum / buf.length);
+}
+
+/* Zero Crossing Rate */
+function zcr(buf){
+  let z=0;
+  for(let i=1;i<buf.length;i++) if((buf[i-1]>=0 && buf[i]<0) || (buf[i-1]<0 && buf[i]>=0)) z++;
+  return z / buf.length;
+}
+
+/* Spectral centroid using FFT magnitudes from AnalyserNode (freqBuf: Uint8Array) */
+function spectralCentroid(freqBuf, sr){
+  const nyq = sr/2;
+  let magSum=0, weightedSum=0;
+  for(let i=0;i<freqBuf.length;i++){
+    const mag = freqBuf[i];
+    const freq = i * nyq / freqBuf.length;
+    magSum += mag;
+    weightedSum += freq * mag;
+  }
+  if(magSum === 0) return 0;
+  return weightedSum / magSum;
+}
+
+/* Simple autocorrelation pitch estimate (Chris Wilson style) */
+function autoCorrelate(buf, sr){
+  const SIZE = buf.length;
+  let rms = 0;
+  for (let i=0;i<SIZE;i++){ rms += buf[i]*buf[i]; }
+  rms = Math.sqrt(rms/SIZE);
+  if (rms < 0.01) return -1; // silence
+
+  let r1 = 0, r2 = SIZE-1, thres = 0.2;
+  for (let i=0;i<SIZE/2;i++){ if (Math.abs(buf[i]) < thres){ r1 = i; break; } }
+  for (let i=1;i<SIZE/2;i++){ if (Math.abs(buf[SIZE-i]) < thres){ r2 = SIZE-i; break; } }
+  buf = buf.slice(r1, r2);
+  const newSize = buf.length;
+  const c = new Array(newSize).fill(0);
+  for (let i=0;i<newSize;i++){
+    for (let j=0;j<newSize-i;j++){
+      c[i] = c[i] + buf[j]*buf[j+i];
+    }
+  }
+  let d = 0;
+  while (c[d] > c[d+1] && d < newSize-2) d++;
+  let maxval = -Infinity, maxpos = -1;
+  for (let i=d; i<newSize; i++){
+    if (c[i] > maxval){ maxval = c[i]; maxpos = i; }
+  }
+  if (maxpos <= 0) return -1;
+  // parabolic interpolation to refine
+  const T0 = maxpos;
+  const x1 = c[T0-1] || 0, x2 = c[T0] || 0, x3 = c[T0+1] || 0;
+  const a = (x1 + x3 - 2*x2)/2;
+  const b = (x3 - x1)/2;
+  let T0ref = T0;
+  if (a !== 0) T0ref = T0 - b/(2*a);
+  return sr / T0ref;
+}
+
+/* Envelope peak counting for crying-like detection */
+function countEnvelopePeaks(histEnv){
+  if(histEnv.length < 6) return 0;
+  let peaks = 0;
+  // simple local maxima count relative to mean + std
+  const m = mean(histEnv), s = std(histEnv);
+  for(let i=1;i<histEnv.length-1;i++){
+    if(histEnv[i] > histEnv[i-1] && histEnv[i] > histEnv[i+1] && histEnv[i] > m + 0.7 * s) peaks++;
+  }
+  return peaks;
+}
+
+/* --- Enhanced Feature Extraction --- */
+// Spectral rolloff (frequency below which 85% of energy is contained)
+function spectralRolloff(freqBuf, sr, rolloffPct=0.85) {
+  const nyq = sr/2;
+  let total = 0;
+  for(let i=0;i<freqBuf.length;i++) total += freqBuf[i];
+  let threshold = total * rolloffPct;
+  let sum = 0;
+  for(let i=0;i<freqBuf.length;i++) {
+    sum += freqBuf[i];
+    if(sum >= threshold) return i * nyq / freqBuf.length;
+  }
+  return 0;
+}
+
+// Energy entropy (measures abrupt changes, useful for tensed/crying)
+function energyEntropy(buf, n=10) {
+  const len = Math.floor(buf.length / n);
+  let ent = 0;
+  let total = 0;
+  const energies = [];
+  for(let i=0;i<n;i++) {
+    let sum = 0;
+    for(let j=0;j<len;j++) sum += buf[i*len+j]*buf[i*len+j];
+    energies.push(sum);
+    total += sum;
+  }
+  for(let i=0;i<n;i++) {
+    const p = energies[i]/(total+1e-12);
+    if(p>0) ent -= p*Math.log2(p);
+  }
+  return ent/Math.log2(n);
+}
+
+/* --- Improved Normalization: median & IQR --- */
+function median(arr) {
+  if(arr.length===0) return 0;
+  const s = [...arr].sort((a,b)=>a-b);
+  const mid = Math.floor(s.length/2);
+  return s.length%2 ? s[mid] : (s[mid-1]+s[mid])/2;
+}
+function iqr(arr) {
+  if(arr.length<4) return 1;
+  const s = [...arr].sort((a,b)=>a-b);
+  const q1 = s[Math.floor(s.length/4)];
+  const q3 = s[Math.floor(3*s.length/4)];
+  return q3-q1 || 1;
+}
+
+/* --- Update mapFeaturesToScores --- */
+function mapFeaturesToScores(feat){
+  pushHist(histPitch, feat.pitchHz>0?feat.pitchHz:0);
+  pushHist(histRms, feat.rms);
+  pushHist(histCentroid, feat.centroidHz);
+  pushHist(histEnvelope, feat.env);
+  if(feat.rolloffHz) pushHist(histRolloff, feat.rolloffHz);
+  if(feat.entropy) pushHist(histEntropy, feat.entropy);
+
+  // Use median/IQR for robust normalization
+  const pitchMed = median(histPitch), pitchIqr = iqr(histPitch);
+  const rmsMed = median(histRms), rmsIqr = iqr(histRms);
+  const centMed = median(histCentroid), centIqr = iqr(histCentroid);
+  const rolloffMed = median(histRolloff||[]), rolloffIqr = iqr(histRolloff||[]);
+  const entropyMed = median(histEntropy||[]), entropyIqr = iqr(histEntropy||[]);
+
+  const normRms = clamp((feat.rms - rmsMed) / (rmsIqr*1.5) + 0.5, 0, 1);
+  const normCentroid = clamp((feat.centroidHz - centMed) / (centIqr*1.5) + 0.5, 0, 1);
+  const normPitch = feat.pitchHz > 0 ? clamp((feat.pitchHz - pitchMed)/(pitchIqr*2) + 0.5, 0, 1) : 0.5;
+  const normRolloff = feat.rolloffHz ? clamp((feat.rolloffHz-rolloffMed)/(rolloffIqr*1.5)+0.5,0,1) : 0.5;
+  const normEntropy = feat.entropy ? clamp((feat.entropy-entropyMed)/(entropyIqr*1.5)+0.5,0,1) : 0.5;
+
+  const pitchVar = std(histPitch) / (pitchMed || 100);
+  const envPeaks = countEnvelopePeaks(histEnvelope);
+  const envBurst = clamp(envPeaks / 4);
+
+  // Refined heuristics (tuned weights)
+  let happy = clamp(0.45*normRms + 0.2*normCentroid + 0.15*normPitch + 0.1*normRolloff + 0.1*normEntropy);
+  let sad = clamp(0.5*(1-normRms) + 0.2*(1-normPitch) + 0.15*(1-normCentroid) + 0.1*(1-normRolloff) + 0.05*(1-normEntropy));
+  let tensed = clamp(0.3*normPitch + 0.25*normRms + 0.2*clamp(pitchVar*2) + 0.15*normEntropy + 0.1*normCentroid);
+  let scared = clamp(0.35*normPitch + 0.25*clamp(pitchVar*1.8) + 0.2*normCentroid + 0.1*normEntropy + 0.1*normRolloff);
+  let crying = clamp(0.5*envBurst + 0.2*normRms + 0.15*normCentroid + 0.1*normEntropy + 0.05*normRolloff);
+
+  const all = {happy, sad, tensed, scared, crying};
+  const maxv = Math.max(...Object.values(all), 1e-6);
+  for (const k in all) all[k] = clamp(all[k] / maxv);
+
+  return all;
+}
+
+/* ----------------- UI rendering ----------------- */
+function renderScoresUI(scores){
+  // update EMA
+  for (const k in scores) emaUpdate(k, scores[k]);
+  // build table
+  const rows = Object.entries(scoresEMA).sort((a,b)=>b[1]-a[1]).map(([k,v])=>{
+    const pct = Math.round(v*100);
+    return `<div style="margin-bottom:8px">
+      <div style="font-weight:700;text-transform:capitalize">${k} <span style="float:right">${pct}%</span></div>
+      <div class="bar"><span style="width:${pct}%"></span></div>
+    </div>`;
+  }).join('');
+  $('#scoreTable').innerHTML = rows;
+  const winner = Object.entries(scoresEMA).sort((a,b)=>b[1]-a[1])[0];
+  const winnerLabel = winner && winner[1] > 0.3 ? winner[0] : '—';
+  $('#winner').textContent = winnerLabel;
+}
+
+function renderFeaturesUI(f){
+  $('#features').textContent = 
+    `pitchHz: ${f.pitchHz>0?f.pitchHz.toFixed(1):'—'} Hz
+rms: ${f.rms.toFixed(3)}
+centroidHz: ${f.centroidHz.toFixed(1)}
+rolloffHz: ${f.rolloffHz?f.rolloffHz.toFixed(1):'—'}
+zcr: ${f.zcr.toFixed(3)}
+entropy: ${f.entropy?f.entropy.toFixed(3):'—'}
+env: ${f.env.toFixed(3)}
+(last peaks: ${countEnvelopePeaks(histEnvelope)})`;
+}
+
+let lastPitch = 0;
+function smoothPitch(newPitch) {
+  if (newPitch < 0) return lastPitch;
+  lastPitch = 0.7 * lastPitch + 0.3 * newPitch;
+  return lastPitch;
+}
+
+/* ----------------- Main loop: read audio, compute features, map & render ----------------- */
+async function start() {
+  if (running) return;
+  $('#startBtn').disabled = true;
+  $('#stopBtn').disabled = false;
+  $('#status').textContent = 'starting…';
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true}});
+    audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+    sampleRate = audioCtx.sampleRate;
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 2048;
+    freqBuf = new Uint8Array(analyser.frequencyBinCount);
+
+    micStream = audioCtx.createMediaStreamSource(stream);
+    micStream.connect(analyser);
+
+    running = true;
+    $('#status').textContent = 'listening…';
+    log('Audio started, sampleRate=', sampleRate);
+
+    // periodic read (approx 12-20 FPS); we use requestAnimationFrame for low-latency
+    function frame(){
+      analyser.getFloatTimeDomainData(timeBuf);
+      analyser.getByteFrequencyData(freqBuf);
+
+      const rms = computeRMS(timeBuf);
+      const pitch = smoothPitch(autoCorrelate(timeBuf, sampleRate));
+      const centroid = spectralCentroid(freqBuf, sampleRate);
+      const z = zcr(timeBuf);
+      const rolloff = spectralRolloff(freqBuf, sampleRate);
+      const entropy = energyEntropy(timeBuf);
+
+      pushHist(histEnvelope, rms);
+
+      const feat = { pitchHz: pitch>0?pitch:-1, rms, centroidHz: centroid, zcr: z, env: rms, rolloffHz: rolloff, entropy };
+      const scores = mapFeaturesToScores(feat);
+      renderScoresUI(scores);
+      renderFeaturesUI(feat);
+
+      // --- Automatic trigger: if "scared" or "crying" score > 0.7, start recording ---
+      if ((scores.scared > 0.7 || scores.crying > 0.7) && !recording) {
+        startRecordingAndSend();
+      }
+
+      rafId = requestAnimationFrame(frame);
+    }
+    frame();
+
+  } catch (err) {
+    log('Start error:', err.message || err);
+    $('#status').textContent = 'error';
+    $('#startBtn').disabled = false;
+    $('#stopBtn').disabled = true;
+    running = false;
+  }
+}
+
+async function stop(){
+  if (!running) return;
+  $('#stopBtn').disabled = true;
+  $('#status').textContent = 'stopping…';
+  try {
+    cancelAnimationFrame(rafId);
+    if (micStream) micStream.disconnect();
+    if (audioCtx) await audioCtx.close();
+  } catch(e){}
+  running = false;
+  $('#status').textContent = 'idle';
+  $('#startBtn').disabled = false;
+  log('Stopped.');
+}
+
+/* Button handlers */
+$('#startBtn').addEventListener('click', start);
+$('#stopBtn').addEventListener('click', stop);
+
+/* Initialize empty UI */
+renderScoresUI({happy:0,sad:0,tensed:0,scared:0,crying:0});
+
+let mediaRecorder, recordStream, recordedChunks = [], recording = false, recordTimeout = null;
+
+async function startRecordingAndSend() {
+  if (recording) return; // Prevent overlapping recordings
+  recording = true;
+  recordedChunks = [];
+  try {
+    recordStream = await navigator.mediaDevices.getUserMedia({audio:true});
+    mediaRecorder = new MediaRecorder(recordStream);
+    mediaRecorder.ondataavailable = e => {
+      if (e.data.size > 0) recordedChunks.push(e.data);
+    };
+    mediaRecorder.onstop = async () => {
+      const blob = new Blob(recordedChunks, {type: 'audio/webm'});
+      // Provide a download link for the user
+      const url = URL.createObjectURL(blob);
+      let link = document.createElement('a');
+      link.href = url;
+      link.download = 'recording.webm';
+      link.textContent = 'Download 20s recording';
+      link.style.display = 'inline-block';
+      link.style.marginTop = '10px';
+      // Remove any previous link
+      const prev = document.getElementById('autoRecordLink');
+      if (prev) prev.remove();
+      link.id = 'autoRecordLink';
+      document.body.appendChild(link);
+      log('Recording complete. Download link ready.');
+      recording = false;
+      recordStream.getTracks().forEach(t=>t.stop());
+    };
+    mediaRecorder.start();
+    log('Automatic recording started');
+    recordTimeout = setTimeout(() => {
+      mediaRecorder.stop();
+      log('Automatic recording stopped');
+    }, 20000); // 20 seconds
+  } catch (err) {
+    log('Record error:', err.message || err);
+    recording = false;
+  }
+}
+</script>
+</body>
+</html>
